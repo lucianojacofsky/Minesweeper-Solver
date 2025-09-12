@@ -51,8 +51,8 @@ npm run dev
 Build de producción:
 
 npm run build && npm run preview
-
-🧠 IA (alto nivel)
+```
+## 🧠 IA (alto nivel)
 
 Determinística:
 Si flags == número ⇒ ocultas adyacentes son seguras.
@@ -71,15 +71,16 @@ Construye restricciones solo sobre la frontera (ocultas junto a números), enume
 Probabilística greedy:
 Si no hay deducciones, elige la celda con menor probabilidad estimada de ser mina.
 
-🗂️ Estructura
+## 🗂️ Estructura
+```
 src/
   App.tsx            # UI principal, lógica de juego, IA y persistencia
   index.css
   main.tsx
 public/
   # coloca sonidos/tiles aquí (opcional)
-
-💾 Datos y Exportación
+```
+## 💾 Datos y Exportación
 
 LocalStorage: guarda runs para leaderboard.
 
@@ -93,19 +94,21 @@ Base .sqlite
 
 Privacidad: todo se guarda localmente en tu navegador; no se envía a servidores.
 
-⚙️ Configuración
+## ⚙️ Configuración
 
 Sonidos/tiles: agrega tus archivos a public/ y enlázalos en los <audio id="sfx-..."> del componente.
 
 sql.js offline:
 Copia node_modules/sql.js/dist/sql-wasm.wasm a public/sql-wasm.wasm y cambia:
-
+```
 // en App.tsx (locateFile):
 locateFile: () => '/sql-wasm.wasm'
-
+```
 🔌 API opcional
 // disponible en window (cuando la app está montada)
+```
 window.minesweeperAPI.getVisibleState()  // matriz visible (H/F/número)
 window.minesweeperAPI.applyMove({ type:'reveal'|'flag'|'chord', r, c })
 window.minesweeperAPI.getMeta()          // { difficulty, seed, rows, cols, mines }
 window.minesweeperAPI.restart('Expert')  // reinicia y opcionalmente cambia dificultad
+```
