@@ -1,11 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { VisibleBoard, NextMove, ProbMap, ExplainStep } from "./solver/types";
 import initSqlJs from "sql.js";
+import { ReplayRecorder, type Replay } from "./replay";
+import ReplayPlayer from "./components/ReplayPlayer";
 
-// ⚠️ Asegúrate de tener el plugin de React para Vite
-// npm i -D @vitejs/plugin-react
-
-// Worker (module)
+// Worker de IA (module)
 const solverWorker = new Worker(new URL("./solver/worker.ts", import.meta.url), { type: "module" });
 
 // -------------------- Juego: config y utilidades --------------------
@@ -63,27 +62,27 @@ type DBRun = {
   username?: string;
 };
 
-type SqlJsDatabase = any; // para evitar problemas de tipos si no tenés @types
+type SqlJsDatabase = any;
 
 async function initDb(): Promise<SqlJsDatabase | null> {
   try {
-    // 1) intenta local (recomendado)
-    const SQL1 = await initSqlJs({
-      locateFile: () => "/sql-wasm.wasm",
-    });
+    // 1) intenta local
+    const SQL1 = await initSqlJs({ locateFile: () => "/sql-wasm.wasm" });
     const stored = localStorage.getItem("ms_db");
-    const db = stored ? new SQL1.Database(Uint8Array.from(atob(stored), (c) => c.charCodeAt(0))) : new SQL1.Database();
+    const db = stored
+      ? new SQL1.Database(Uint8Array.from(atob(stored), (c) => c.charCodeAt(0)))
+      : new SQL1.Database();
     ensureSchema(db);
     return db;
   } catch (e) {
     console.warn("sql.js local wasm falló, intentando CDN…", e);
     try {
-      // 2) fallback CDN oficial
-      const SQL2 = await initSqlJs({
-        locateFile: (file: string) => `https://sql.js.org/dist/${file}`,
-      });
+      // 2) fallback CDN
+      const SQL2 = await initSqlJs({ locateFile: (f: string) => `https://sql.js.org/dist/${f}` });
       const stored = localStorage.getItem("ms_db");
-      const db = stored ? new SQL2.Database(Uint8Array.from(atob(stored), (c) => c.charCodeAt(0))) : new SQL2.Database();
+      const db = stored
+        ? new SQL2.Database(Uint8Array.from(atob(stored), (c) => c.charCodeAt(0)))
+        : new SQL2.Database();
       ensureSchema(db);
       return db;
     } catch (e2) {
@@ -107,6 +106,17 @@ function ensureSchema(db: SqlJsDatabase) {
     );
     CREATE INDEX IF NOT EXISTS idx_runs_diff ON runs(difficulty);
     CREATE INDEX IF NOT EXISTS idx_runs_ts ON runs(ts);
+
+    CREATE TABLE IF NOT EXISTS replays (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      difficulty TEXT NOT NULL,
+      seed INTEGER NOT NULL,
+      result TEXT NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_replays_diff ON replays(difficulty);
+    CREATE INDEX IF NOT EXISTS idx_replays_ts ON replays(ts);
   `);
 }
 
@@ -117,7 +127,6 @@ function dbInsertRun(db: SqlJsDatabase, run: DBRun) {
   stmt.run([run.ts, run.difficulty, run.seed, run.result, run.timeSec, run.aiType ?? null, run.username ?? null]);
   stmt.free?.();
 }
-
 function dbSelectTop(db: SqlJsDatabase, diff: DiffKey, limit = 10): DBRun[] {
   const stmt = db.prepare(
     `SELECT ts, difficulty, seed, result, timeSec, aiType, username
@@ -140,6 +149,32 @@ function dbSelectTop(db: SqlJsDatabase, diff: DiffKey, limit = 10): DBRun[] {
   stmt.free?.();
   return out;
 }
+function dbInsertReplay(db: SqlJsDatabase, replay: Replay) {
+  const stmt = db.prepare(
+    "INSERT INTO replays (ts, difficulty, seed, result, data) VALUES (?, ?, ?, ?, ?)"
+  );
+  stmt.run([
+    replay.meta.startedAt,
+    replay.meta.difficulty,
+    replay.meta.seed,
+    replay.meta.result,
+    JSON.stringify(replay),
+  ]);
+  stmt.free?.();
+}
+function dbSelectRecentReplays(db: SqlJsDatabase, limit = 10): Replay[] {
+  const stmt = db.prepare(`SELECT data FROM replays ORDER BY ts DESC LIMIT ?`);
+  const out: Replay[] = [];
+  stmt.bind([limit]);
+  while (stmt.step()) {
+    const row = stmt.getAsObject() as any;
+    try {
+      out.push(JSON.parse(row.data));
+    } catch {}
+  }
+  stmt.free?.();
+  return out;
+}
 
 function dbExportToLocalStorage(db: SqlJsDatabase) {
   const binary = db.export();
@@ -155,13 +190,11 @@ function downloadFile(name: string, data: Blob) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
-
 function exportSqlite(db: SqlJsDatabase) {
   const binary = db.export();
   const blob = new Blob([binary], { type: "application/octet-stream" });
   downloadFile("minesweeper.sqlite", blob);
 }
-
 async function importSqlite(dbRef: React.MutableRefObject<SqlJsDatabase | null>, file: File) {
   const buf = new Uint8Array(await file.arrayBuffer());
   const SQL = (await initSqlJs({ locateFile: () => "/sql-wasm.wasm" })) as any;
@@ -171,7 +204,7 @@ async function importSqlite(dbRef: React.MutableRefObject<SqlJsDatabase | null>,
   dbExportToLocalStorage(newDb);
 }
 
-// -------------------- Leaderboard (usa SQLite si existe; fallback LS) --------------------
+// -------------------- Leaderboard (SQLite o LocalStorage) --------------------
 function getTopRunsLS(limit = 10, difficulty?: DiffKey): DBRun[] {
   try {
     const rows: any[] = JSON.parse(localStorage.getItem("ms_runs") || "[]");
@@ -185,7 +218,6 @@ function getTopRunsLS(limit = 10, difficulty?: DiffKey): DBRun[] {
     return [];
   }
 }
-
 function Leaderboard({
   diff,
   db,
@@ -234,7 +266,7 @@ export default function App() {
   const [flags, setFlags] = useState(0);
   const [seconds, setSeconds] = useState(0);
 
-  // Sprint (Explainable + Heatmap + Worker)
+  // Sprint: Explainable + Heatmap + Worker
   const [showExplain, setShowExplain] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [lastExplain, setLastExplain] = useState<ExplainStep | null>(null);
@@ -244,6 +276,11 @@ export default function App() {
   // SQLite
   const dbRef = useRef<SqlJsDatabase | null>(null);
   const [dbReady, setDbReady] = useState(false);
+
+  // Replays
+  const recorderRef = useRef(new ReplayRecorder());
+  const [replayOpen, setReplayOpen] = useState(false);
+  const [currentReplay, setCurrentReplay] = useState<Replay | null>(null);
 
   // reloj
   useEffect(() => {
@@ -270,8 +307,14 @@ export default function App() {
         const move: NextMove = data.move;
         if (move && showExplain) setLastExplain(move.explain);
         if (move) {
-          if (move.type === "reveal") onReveal(move.r, move.c);
-          else if (move.type === "flag") onFlag(move.r, move.c);
+          const by = "ai" as const;
+          if (move.type === "reveal") {
+            recorderRef.current.push({ r: move.r, c: move.c, type: "reveal", by });
+            onReveal(move.r, move.c);
+          } else if (move.type === "flag") {
+            recorderRef.current.push({ r: move.r, c: move.c, type: "flag", by });
+            onFlag(move.r, move.c);
+          }
         }
       } else if (data?.kind === "probMap") {
         setProbMap(data.probs);
@@ -300,7 +343,7 @@ export default function App() {
       }
 
     const rng = mulberry32(seed);
-    for (let i = pool.length - 1; i > 0; i--) {
+    for (let i = pool.length - 1; i > 0; i++) {
       const j = Math.floor(rng() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
     }
@@ -351,11 +394,26 @@ export default function App() {
       setWon(true);
       setAlive(false);
       saveRun("win");
+
+      // cerrar y guardar replay
+      const rep = recorderRef.current.end("win");
+      if (dbRef.current) {
+        dbInsertReplay(dbRef.current, rep);
+        dbExportToLocalStorage(dbRef.current);
+      }
+      try {
+        const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
+        arr.unshift(rep);
+        localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
+      } catch {}
     }
   }
 
   function onReveal(r: number, c: number) {
     if (!alive) return;
+    // registrar jugada humana
+    recorderRef.current.push({ r, c, type: "reveal", by: "human" });
+
     setBoard((prev) => {
       const b = prev.map((row) => row.map((x) => ({ ...x })));
       if (firstClick) {
@@ -368,6 +426,18 @@ export default function App() {
         setAlive(false);
         setWon(false);
         saveRun("lose");
+
+        const rep = recorderRef.current.end("lose");
+        if (dbRef.current) {
+          dbInsertReplay(dbRef.current, rep);
+          dbExportToLocalStorage(dbRef.current);
+        }
+        try {
+          const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
+          arr.unshift(rep);
+          localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
+        } catch {}
+
         return revealAll(b);
       }
       if (cell.state !== HIDDEN) return prev;
@@ -379,6 +449,9 @@ export default function App() {
 
   function onFlag(r: number, c: number) {
     if (!alive) return;
+    // registrar jugada humana
+    recorderRef.current.push({ r, c, type: "flag", by: "human" });
+
     setBoard((prev) => {
       const b = prev.map((row) => row.map((x) => ({ ...x })));
       const cell = b[r][c];
@@ -397,8 +470,10 @@ export default function App() {
   function reset(newDiff?: DiffKey) {
     const d = newDiff || diff;
     const cfg2 = DIFFS[d];
+    const nextSeed = Date.now();
+
     setDiff(d);
-    setSeed(Date.now());
+    setSeed(nextSeed);
     setBoard(createEmptyBoard(cfg2));
     setAlive(true);
     setWon(false);
@@ -407,6 +482,9 @@ export default function App() {
     setSeconds(0);
     setLastExplain(null);
     setProbMap(null);
+
+    // iniciar recorder para nuevo run
+    recorderRef.current.begin(d, nextSeed);
   }
 
   function saveRun(result: "win" | "lose") {
@@ -420,7 +498,6 @@ export default function App() {
       username: "",
     };
 
-    // 1) SQLite si está disponible
     if (dbRef.current) {
       try {
         dbInsertRun(dbRef.current, run);
@@ -430,7 +507,6 @@ export default function App() {
       }
     }
 
-    // 2) Fallback LocalStorage
     try {
       const key = "ms_runs";
       const prev: DBRun[] = JSON.parse(localStorage.getItem(key) || "[]");
@@ -531,7 +607,7 @@ export default function App() {
         {/* Leaderboard (SQLite o LS) */}
         <Leaderboard diff={diff} db={dbRef.current} />
 
-        {/* Export / Import DB */}
+        {/* Export / Import DB y Replay */}
         <div className="mb-4 flex flex-wrap gap-2">
           <button
             className="px-3 py-1 rounded-xl bg-emerald-600 text-white disabled:opacity-40"
@@ -540,6 +616,7 @@ export default function App() {
           >
             ⬇️ Exportar DB (.sqlite)
           </button>
+
           <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer">
             ⬆️ Importar DB
             <input
@@ -552,6 +629,72 @@ export default function App() {
               }}
             />
           </label>
+
+          {/* Replays JSON */}
+          <button
+            className="px-3 py-1 rounded-xl bg-indigo-600 text-white"
+            onClick={() => {
+              let rep: Replay | null = null;
+              if (dbRef.current) {
+                const list = dbSelectRecentReplays(dbRef.current, 1);
+                if (list.length) rep = list[0];
+              }
+              if (!rep) {
+                try {
+                  const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
+                  if (arr.length) rep = arr[0];
+                } catch {}
+              }
+              if (!rep) return alert("No hay replays para exportar aún.");
+              const blob = new Blob([JSON.stringify(rep, null, 2)], { type: "application/json" });
+              downloadFile(`replay-${rep.meta.difficulty}-${rep.meta.seed}.json`, blob);
+            }}
+          >
+            💾 Exportar Replay (.json)
+          </button>
+
+          <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer">
+            📥 Importar Replay
+            <input
+              type="file"
+              className="hidden"
+              accept="application/json"
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                const txt = await f.text();
+                try {
+                  const rep = JSON.parse(txt) as Replay;
+                  setCurrentReplay(rep);
+                  setReplayOpen(true);
+                } catch {
+                  alert("JSON inválido");
+                }
+              }}
+            />
+          </label>
+
+          <button
+            className="px-3 py-1 rounded-xl bg-purple-600 text-white"
+            onClick={() => {
+              let rep: Replay | null = null;
+              if (dbRef.current) {
+                const list = dbSelectRecentReplays(dbRef.current, 1);
+                if (list.length) rep = list[0];
+              }
+              if (!rep) {
+                try {
+                  const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
+                  if (arr.length) rep = arr[0];
+                } catch {}
+              }
+              if (!rep) return alert("No hay replays guardados.");
+              setCurrentReplay(rep);
+              setReplayOpen(true);
+            }}
+          >
+            ▶ Ver último Replay
+          </button>
         </div>
 
         {/* Tablero */}
@@ -613,7 +756,7 @@ export default function App() {
 
         {/* Panel de explicación */}
         {showExplain && (
-          <div className="mt-3 rounded-xl border bg-white shadow p-3 text-sm">
+          <div className="mt-3 rounded-2xl border bg-white shadow p-3 text-sm">
             <div className="flex items-center justify-between">
               <h3 className="font-semibold">Explicación de la última jugada</h3>
               <span className="text-xs text-gray-500">Frontier: {frontierSize} celdas</span>
@@ -627,6 +770,32 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* Reproductor de Replay */}
+        <ReplayPlayer
+          open={replayOpen}
+          onClose={() => setReplayOpen(false)}
+          replay={currentReplay}
+          resetToSeed={(difficulty, seedNum) => {
+            setDiff(difficulty as DiffKey);
+            const cfg2 = DIFFS[difficulty as DiffKey];
+            setSeed(seedNum);
+            setBoard(createEmptyBoard(cfg2));
+            setAlive(true);
+            setWon(false);
+            setFirstClick(true);
+            setFlags(0);
+            setSeconds(0);
+            setLastExplain(null);
+            setProbMap(null);
+            recorderRef.current.begin(difficulty as DiffKey, seedNum);
+          }}
+          applyMove={(m) => {
+            if (m.type === "reveal") onReveal(m.r, m.c);
+            else if (m.type === "flag") onFlag(m.r, m.c);
+            // si tienes "chord" agrega aquí su handler
+          }}
+        />
       </div>
     </div>
   );
