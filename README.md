@@ -152,12 +152,4 @@ public/
     "preview": "vite preview"
   }
 }
-
-🔌 API opcional
-// disponible en window (cuando la app está montada)
-```
-window.minesweeperAPI.getVisibleState()  // matriz visible (H/F/número)
-window.minesweeperAPI.applyMove({ type:'reveal'|'flag'|'chord', r, c })
-window.minesweeperAPI.getMeta()          // { difficulty, seed, rows, cols, mines }
-window.minesweeperAPI.restart('Expert')  // reinicia y opcionalmente cambia dificultad
 ```
