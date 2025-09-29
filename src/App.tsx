@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import type { VisibleBoard, NextMove, ProbMap, ExplainStep } from "./solver/types";
+import type { VisibleBoard, NextMove, ProbMap, ExplainStep, BenchmarkResult, BenchmarkRow } from "./solver/types";
 import initSqlJs from "sql.js";
 import { ReplayRecorder, type Replay } from "./replay";
 import ReplayPlayer from "./components/ReplayPlayer";
+import BenchmarkModal from "./components/BenchmarkModal";
 
 // Worker de IA (module)
 const solverWorker = new Worker(new URL("./solver/worker.ts", import.meta.url), { type: "module" });
@@ -66,7 +67,6 @@ type SqlJsDatabase = any;
 
 async function initDb(): Promise<SqlJsDatabase | null> {
   try {
-    // 1) intenta local
     const SQL1 = await initSqlJs({ locateFile: () => "/sql-wasm.wasm" });
     const stored = localStorage.getItem("ms_db");
     const db = stored
@@ -77,7 +77,6 @@ async function initDb(): Promise<SqlJsDatabase | null> {
   } catch (e) {
     console.warn("sql.js local wasm falló, intentando CDN…", e);
     try {
-      // 2) fallback CDN
       const SQL2 = await initSqlJs({ locateFile: (f: string) => `https://sql.js.org/dist/${f}` });
       const stored = localStorage.getItem("ms_db");
       const db = stored
@@ -266,7 +265,7 @@ export default function App() {
   const [flags, setFlags] = useState(0);
   const [seconds, setSeconds] = useState(0);
 
-  // Sprint: Explainable + Heatmap + Worker
+  // Explainable + Heatmap + Worker
   const [showExplain, setShowExplain] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [lastExplain, setLastExplain] = useState<ExplainStep | null>(null);
@@ -281,6 +280,12 @@ export default function App() {
   const recorderRef = useRef(new ReplayRecorder());
   const [replayOpen, setReplayOpen] = useState(false);
   const [currentReplay, setCurrentReplay] = useState<Replay | null>(null);
+
+  // Benchmark
+  const [benchOpen, setBenchOpen] = useState(false);
+  const [benchRows, setBenchRows] = useState<BenchmarkRow[]>([]);
+  const [benchRunning, setBenchRunning] = useState(false);
+  const [benchN, setBenchN] = useState(50);
 
   // reloj
   useEffect(() => {
@@ -302,9 +307,9 @@ export default function App() {
   // worker listener
   useEffect(() => {
     const onMsg = (ev: MessageEvent<any>) => {
-      const data = ev.data;
+      const data = ev.data as ComputeResult | ProbResult | BenchmarkResult | any;
       if (data?.kind === "computeMove") {
-        const move: NextMove = data.move;
+        const move: NextMove = (data as ComputeResult).move;
         if (move && showExplain) setLastExplain(move.explain);
         if (move) {
           const by = "ai" as const;
@@ -317,8 +322,13 @@ export default function App() {
           }
         }
       } else if (data?.kind === "probMap") {
-        setProbMap(data.probs);
-        setFrontierSize(data.frontierSize);
+        setProbMap((data as ProbResult).probs);
+        setFrontierSize((data as ProbResult).frontierSize);
+      } else if (data?.kind === "benchmark") {
+        const rows = (data as BenchmarkResult).rows;
+        setBenchRows(rows);
+        setBenchRunning(false);
+        setBenchOpen(true);
       }
     };
     solverWorker.addEventListener("message", onMsg);
@@ -327,7 +337,7 @@ export default function App() {
   }, [showExplain]);
 
   // -------------------- Lógica de juego --------------------
-  function placeMinesAvoiding(b: Cell[][], sr: number, sc: number) {
+  function placeMinesAvoiding(b: Cell[][], cfg: Cfg, seedNum: number, sr: number, sc: number) {
     const R = cfg.rows,
       C = cfg.cols,
       M = cfg.mines;
@@ -342,7 +352,7 @@ export default function App() {
         if (!banned.has(id)) pool.push(id);
       }
 
-    const rng = mulberry32(seed);
+    const rng = mulberry32(seedNum);
     for (let i = pool.length - 1; i > 0; i++) {
       const j = Math.floor(rng() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
@@ -353,7 +363,6 @@ export default function App() {
         c = id % C;
       b[r][c].mine = true;
     }
-    // números
     for (let r = 0; r < R; r++)
       for (let c = 0; c < C; c++) {
         let cnt = 0;
@@ -362,7 +371,7 @@ export default function App() {
       }
   }
 
-  function revealFlood(b: Cell[][], r: number, c: number) {
+  function revealFlood(b: Cell[][], cfg: Cfg, r: number, c: number) {
     const R = cfg.rows,
       C = cfg.cols;
     const q: [number, number][] = [];
@@ -394,8 +403,6 @@ export default function App() {
       setWon(true);
       setAlive(false);
       saveRun("win");
-
-      // cerrar y guardar replay
       const rep = recorderRef.current.end("win");
       if (dbRef.current) {
         dbInsertReplay(dbRef.current, rep);
@@ -411,13 +418,12 @@ export default function App() {
 
   function onReveal(r: number, c: number) {
     if (!alive) return;
-    // registrar jugada humana
     recorderRef.current.push({ r, c, type: "reveal", by: "human" });
 
     setBoard((prev) => {
       const b = prev.map((row) => row.map((x) => ({ ...x })));
       if (firstClick) {
-        placeMinesAvoiding(b, r, c);
+        placeMinesAvoiding(b, cfg, seed, r, c);
         setFirstClick(false);
       }
       const cell = b[r][c];
@@ -426,7 +432,6 @@ export default function App() {
         setAlive(false);
         setWon(false);
         saveRun("lose");
-
         const rep = recorderRef.current.end("lose");
         if (dbRef.current) {
           dbInsertReplay(dbRef.current, rep);
@@ -437,11 +442,10 @@ export default function App() {
           arr.unshift(rep);
           localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
         } catch {}
-
         return revealAll(b);
       }
       if (cell.state !== HIDDEN) return prev;
-      revealFlood(b, r, c);
+      revealFlood(b, cfg, r, c);
       checkWin(b);
       return b;
     });
@@ -449,9 +453,7 @@ export default function App() {
 
   function onFlag(r: number, c: number) {
     if (!alive) return;
-    // registrar jugada humana
     recorderRef.current.push({ r, c, type: "flag", by: "human" });
-
     setBoard((prev) => {
       const b = prev.map((row) => row.map((x) => ({ ...x })));
       const cell = b[r][c];
@@ -471,7 +473,6 @@ export default function App() {
     const d = newDiff || diff;
     const cfg2 = DIFFS[d];
     const nextSeed = Date.now();
-
     setDiff(d);
     setSeed(nextSeed);
     setBoard(createEmptyBoard(cfg2));
@@ -482,8 +483,6 @@ export default function App() {
     setSeconds(0);
     setLastExplain(null);
     setProbMap(null);
-
-    // iniciar recorder para nuevo run
     recorderRef.current.begin(d, nextSeed);
   }
 
@@ -497,7 +496,6 @@ export default function App() {
       aiType: "human",
       username: "",
     };
-
     if (dbRef.current) {
       try {
         dbInsertRun(dbRef.current, run);
@@ -506,7 +504,6 @@ export default function App() {
         console.warn("Fallo insert SQLite, fallback a LocalStorage", e);
       }
     }
-
     try {
       const key = "ms_runs";
       const prev: DBRun[] = JSON.parse(localStorage.getItem(key) || "[]");
@@ -520,7 +517,7 @@ export default function App() {
       row.map((cell) => {
         if (cell.state === FLAGGED) return "F";
         if (cell.state === HIDDEN) return "H";
-        return cell.adj; // 0..8
+        return cell.adj;
       })
     );
   }
@@ -531,10 +528,19 @@ export default function App() {
     [cfg.cols]
   );
 
+  function runBenchmark() {
+    if (benchRunning) return;
+    // Genero N seeds determinísticas a partir del tiempo
+    const base = Date.now();
+    const seeds = Array.from({ length: benchN }, (_, i) => base + i * 17);
+    setBenchRunning(true);
+    solverWorker.postMessage({ kind: "benchmark", difficulty: diff, seeds });
+  }
+
   // -------------------- Render --------------------
   return (
     <div className="min-h-screen w-full bg-gray-50 text-gray-900 flex items-center justify-center p-4">
-      <div className="w-full max-w-5xl">
+      <div className="w-full max-w-6xl">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-bold">Minesweeper</h1>
@@ -555,7 +561,7 @@ export default function App() {
             </span>
           </div>
 
-          <div className="flex gap-2 items-center">
+          <div className="flex flex-wrap gap-2 items-center">
             <button
               className="px-3 py-1 rounded-xl bg-blue-600 text-white"
               onClick={() =>
@@ -597,6 +603,27 @@ export default function App() {
             >
               Recalcular P()
             </button>
+
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-700">N:</label>
+              <input
+                type="number"
+                className="w-20 border rounded px-2 py-1 text-sm"
+                min={5}
+                max={500}
+                value={benchN}
+                onChange={(e) => setBenchN(Math.max(5, Math.min(500, parseInt(e.target.value || "0"))))}
+                title="Cantidad de seeds a correr"
+              />
+              <button
+                className={`px-3 py-1 rounded-xl ${benchRunning ? "bg-gray-300 text-gray-600" : "bg-emerald-600 text-white"}`}
+                onClick={runBenchmark}
+                disabled={benchRunning}
+                title="Corre la IA en N seeds y muestra métricas"
+              >
+                {benchRunning ? "⏳ Benchmark…" : "🏁 Benchmark"}
+              </button>
+            </div>
 
             <button className="px-3 py-1 rounded-xl bg-gray-900 text-white" onClick={() => reset()}>
               {won ? "🏆 Nuevo" : alive ? "🙂 Reset" : "💥 Nuevo"}
@@ -793,9 +820,11 @@ export default function App() {
           applyMove={(m) => {
             if (m.type === "reveal") onReveal(m.r, m.c);
             else if (m.type === "flag") onFlag(m.r, m.c);
-            // si tienes "chord" agrega aquí su handler
           }}
         />
+
+        {/* Modal Benchmark */}
+        <BenchmarkModal open={benchOpen} onClose={() => setBenchOpen(false)} rows={benchRows} />
       </div>
     </div>
   );
