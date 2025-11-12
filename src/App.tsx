@@ -295,6 +295,12 @@ export default function App() {
     return () => clearInterval(id);
   }, [alive, won, firstClick]);
 
+  // Asegurar estado inicial correcto al montar
+  useEffect(() => {
+    setAlive(true);
+    setWon(false);
+  }, []);
+
   // init DB
   useEffect(() => {
     (async () => {
@@ -725,7 +731,7 @@ export default function App() {
         </div>
 
         {/* Tablero */}
-        <div className="rounded-2xl border bg-white shadow p-2" onContextMenu={(e) => e.preventDefault()}>
+        <div className="relative z-10 rounded-2xl border bg-white shadow p-2" onContextMenu={(e) => e.preventDefault()}>
           <div className="grid gap-1" style={gridStyle}>
             {board.map((row, r) =>
               row.map((cell, c) => {
