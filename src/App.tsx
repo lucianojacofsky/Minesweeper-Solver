@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { VisibleBoard, NextMove, ProbMap, ExplainStep, BenchmarkResult, BenchmarkRow } from "./solver/types";
-import initSqlJs from "sql.js";
+import initSqlJs, { type Database } from "sql.js";
 import { ReplayRecorder, type Replay } from "./replay";
 import ReplayPlayer from "./components/ReplayPlayer";
 import BenchmarkModal from "./components/BenchmarkModal";
@@ -63,9 +63,7 @@ type DBRun = {
   username?: string;
 };
 
-type SqlJsDatabase = any;
-
-async function initDb(): Promise<SqlJsDatabase | null> {
+async function initDb(): Promise<Database | null> {
   try {
     const SQL1 = await initSqlJs({ locateFile: () => "/sql-wasm.wasm" });
     const stored = localStorage.getItem("ms_db");
@@ -91,7 +89,7 @@ async function initDb(): Promise<SqlJsDatabase | null> {
   }
 }
 
-function ensureSchema(db: SqlJsDatabase) {
+function ensureSchema(db: Database) {
   db.run(`
     CREATE TABLE IF NOT EXISTS runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,14 +117,14 @@ function ensureSchema(db: SqlJsDatabase) {
   `);
 }
 
-function dbInsertRun(db: SqlJsDatabase, run: DBRun) {
+function dbInsertRun(db: Database, run: DBRun) {
   const stmt = db.prepare(
     "INSERT INTO runs (ts, difficulty, seed, result, timeSec, aiType, username) VALUES (?, ?, ?, ?, ?, ?, ?)"
   );
   stmt.run([run.ts, run.difficulty, run.seed, run.result, run.timeSec, run.aiType ?? null, run.username ?? null]);
   stmt.free?.();
 }
-function dbSelectTop(db: SqlJsDatabase, diff: DiffKey, limit = 10): DBRun[] {
+function dbSelectTop(db: Database, diff: DiffKey, limit = 10): DBRun[] {
   const stmt = db.prepare(
     `SELECT ts, difficulty, seed, result, timeSec, aiType, username
      FROM runs WHERE difficulty = ? ORDER BY (result='win') DESC, timeSec ASC, ts DESC LIMIT ?`
@@ -148,7 +146,7 @@ function dbSelectTop(db: SqlJsDatabase, diff: DiffKey, limit = 10): DBRun[] {
   stmt.free?.();
   return out;
 }
-function dbInsertReplay(db: SqlJsDatabase, replay: Replay) {
+function dbInsertReplay(db: Database, replay: Replay) {
   const stmt = db.prepare(
     "INSERT INTO replays (ts, difficulty, seed, result, data) VALUES (?, ?, ?, ?, ?)"
   );
@@ -161,7 +159,7 @@ function dbInsertReplay(db: SqlJsDatabase, replay: Replay) {
   ]);
   stmt.free?.();
 }
-function dbSelectRecentReplays(db: SqlJsDatabase, limit = 10): Replay[] {
+function dbSelectRecentReplays(db: Database, limit = 10): Replay[] {
   const stmt = db.prepare(`SELECT data FROM replays ORDER BY ts DESC LIMIT ?`);
   const out: Replay[] = [];
   stmt.bind([limit]);
@@ -175,7 +173,7 @@ function dbSelectRecentReplays(db: SqlJsDatabase, limit = 10): Replay[] {
   return out;
 }
 
-function dbExportToLocalStorage(db: SqlJsDatabase) {
+function dbExportToLocalStorage(db: Database) {
   const binary = db.export();
   const b64 = btoa(String.fromCharCode.apply(null, Array.from(binary)));
   localStorage.setItem("ms_db", b64);
@@ -189,12 +187,12 @@ function downloadFile(name: string, data: Blob) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
-function exportSqlite(db: SqlJsDatabase) {
+function exportSqlite(db: Database) {
   const binary = db.export();
   const blob = new Blob([binary], { type: "application/octet-stream" });
   downloadFile("minesweeper.sqlite", blob);
 }
-async function importSqlite(dbRef: React.MutableRefObject<SqlJsDatabase | null>, file: File) {
+async function importSqlite(dbRef: React.MutableRefObject<Database | null>, file: File) {
   const buf = new Uint8Array(await file.arrayBuffer());
   const SQL = (await initSqlJs({ locateFile: () => "/sql-wasm.wasm" })) as any;
   const newDb = new SQL.Database(buf);
@@ -223,7 +221,7 @@ function Leaderboard({
   limit = 10,
 }: {
   diff: DiffKey;
-  db: SqlJsDatabase | null;
+  db: Database | null;
   limit?: number;
 }) {
   const [rows, setRows] = useState<DBRun[]>([]);
@@ -273,7 +271,7 @@ export default function App() {
   const [frontierSize, setFrontierSize] = useState(0);
 
   // SQLite
-  const dbRef = useRef<SqlJsDatabase | null>(null);
+  const dbRef = useRef<Database | null>(null);
   const [dbReady, setDbReady] = useState(false);
 
   // Replays
@@ -287,9 +285,10 @@ export default function App() {
   const [benchRunning, setBenchRunning] = useState(false);
   const [benchN, setBenchN] = useState(50);
 
-  // reloj
+  // Reloj principal del juego
   useEffect(() => {
     const id = window.setInterval(() => {
+      // Avanza el reloj solo si la partida está activa y no ha sido el primer clic
       if (alive && !won && !firstClick) setSeconds((s) => s + 1);
     }, 1000);
     return () => clearInterval(id);
@@ -301,7 +300,7 @@ export default function App() {
     setWon(false);
   }, []);
 
-  // init DB
+  // Inicializa la base de datos (sql.js) al cargar la app
   useEffect(() => {
     (async () => {
       const db = await initDb();
@@ -310,10 +309,12 @@ export default function App() {
     })();
   }, []);
 
-  // worker listener
+  // Listener para mensajes del Web Worker de la IA
   useEffect(() => {
     const onMsg = (ev: MessageEvent<any>) => {
       const data = ev.data as ComputeResult | ProbResult | BenchmarkResult | any;
+
+      // Recibe el siguiente movimiento calculado por la IA
       if (data?.kind === "computeMove") {
         const move: NextMove = (data as ComputeResult).move;
         if (move && showExplain) setLastExplain(move.explain);
@@ -327,9 +328,11 @@ export default function App() {
             onFlag(move.r, move.c);
           }
         }
+        // Recibe el mapa de probabilidades (heatmap)
       } else if (data?.kind === "probMap") {
         setProbMap((data as ProbResult).probs);
         setFrontierSize((data as ProbResult).frontierSize);
+        // Recibe los resultados del benchmark
       } else if (data?.kind === "benchmark") {
         const rows = (data as BenchmarkResult).rows;
         setBenchRows(rows);
@@ -410,16 +413,20 @@ export default function App() {
       setAlive(false);
       saveRun("win");
       const rep = recorderRef.current.end("win");
-      if (dbRef.current) {
-        dbInsertReplay(dbRef.current, rep);
-        dbExportToLocalStorage(dbRef.current);
-      }
-      try {
-        const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
-        arr.unshift(rep);
-        localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
-      } catch {}
+      saveReplay(rep);
     }
+  }
+
+  function saveReplay(rep: Replay) {
+    if (dbRef.current) {
+      dbInsertReplay(dbRef.current, rep);
+      dbExportToLocalStorage(dbRef.current);
+    }
+    try {
+      const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
+      arr.unshift(rep);
+      localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
+    } catch {}
   }
 
   function onReveal(r: number, c: number) {
@@ -439,15 +446,7 @@ export default function App() {
         setWon(false);
         saveRun("lose");
         const rep = recorderRef.current.end("lose");
-        if (dbRef.current) {
-          dbInsertReplay(dbRef.current, rep);
-          dbExportToLocalStorage(dbRef.current);
-        }
-        try {
-          const arr = JSON.parse(localStorage.getItem("ms_replays") || "[]");
-          arr.unshift(rep);
-          localStorage.setItem("ms_replays", JSON.stringify(arr.slice(0, 20)));
-        } catch {}
+        saveReplay(rep);
         return revealAll(b);
       }
       if (cell.state !== HIDDEN) return prev;
@@ -489,6 +488,8 @@ export default function App() {
     setSeconds(0);
     setLastExplain(null);
     setProbMap(null);
+    setBenchOpen(false);
+    setBenchRunning(false);
     recorderRef.current.begin(d, nextSeed);
   }
 
@@ -631,7 +632,11 @@ export default function App() {
               </button>
             </div>
 
-            <button className="px-3 py-1 rounded-xl bg-gray-900 text-white" onClick={() => reset()}>
+            <button
+              className="px-3 py-1 rounded-xl bg-gray-900 text-white"
+              onClick={() => reset()}
+              aria-label={won ? "Nueva partida" : alive ? "Reiniciar partida" : "Nueva partida"}
+            >
               {won ? "🏆 Nuevo" : alive ? "🙂 Reset" : "💥 Nuevo"}
             </button>
           </div>
@@ -646,11 +651,12 @@ export default function App() {
             className="px-3 py-1 rounded-xl bg-emerald-600 text-white disabled:opacity-40"
             onClick={() => dbRef.current && exportSqlite(dbRef.current)}
             disabled={!dbReady || !dbRef.current}
+            aria-label="Exportar base de datos en formato .sqlite"
           >
             ⬇️ Exportar DB (.sqlite)
           </button>
 
-          <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer">
+          <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer" aria-label="Importar base de datos">
             ⬆️ Importar DB
             <input
               type="file"
@@ -682,11 +688,12 @@ export default function App() {
               const blob = new Blob([JSON.stringify(rep, null, 2)], { type: "application/json" });
               downloadFile(`replay-${rep.meta.difficulty}-${rep.meta.seed}.json`, blob);
             }}
+            aria-label="Exportar la última repetición en formato .json"
           >
             💾 Exportar Replay (.json)
           </button>
 
-          <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer">
+          <label className="px-3 py-1 rounded-xl bg-slate-200 cursor-pointer" aria-label="Importar repetición">
             📥 Importar Replay
             <input
               type="file"
@@ -725,6 +732,7 @@ export default function App() {
               setCurrentReplay(rep);
               setReplayOpen(true);
             }}
+            aria-label="Ver la última repetición guardada"
           >
             ▶ Ver último Replay
           </button>
